@@ -4,12 +4,14 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { DrawIoEmbed } from "react-drawio"
 import type { ImperativePanelHandle } from "react-resizable-panels"
 import ChatPanel from "@/components/chat-panel"
+import { FileManagerBar } from "@/components/github/FileManagerBar"
 import {
     ResizableHandle,
     ResizablePanel,
     ResizablePanelGroup,
 } from "@/components/ui/resizable"
 import { useDiagram } from "@/contexts/diagram-context"
+import type { DiagramFile } from "@/lib/diagram-files"
 import { type DrawioTheme, isDrawioTheme } from "@/lib/drawio-themes"
 import { i18n, type Locale } from "@/lib/i18n/config"
 
@@ -18,9 +20,13 @@ export default function Home() {
         drawioRef,
         handleDiagramExport,
         handleDiagramAutoSave,
+        loadDiagram,
         onDrawioLoad,
         resetDrawioReady,
     } = useDiagram()
+    const [currentFileId, setCurrentFileId] = useState<string | null>(null)
+    const currentFileRef = useRef<DiagramFile | null>(null)
+    const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const router = useRouter()
     const pathname = usePathname()
     // Extract current language from pathname (e.g., "/zh/about" → "zh")
@@ -154,12 +160,62 @@ export default function Home() {
         return () => window.removeEventListener("keydown", handleKeyDown)
     }, [])
 
+    // Cleanup auto-save timer on unmount
+    useEffect(() => {
+        return () => {
+            if (autoSaveTimerRef.current) {
+                clearTimeout(autoSaveTimerRef.current)
+            }
+        }
+    }, [])
+
+    const handleFileSelect = useCallback(
+        async (file: DiagramFile) => {
+            setCurrentFileId(file.id)
+            currentFileRef.current = file
+            if (file.xml) {
+                loadDiagram(file.xml, true)
+            }
+        },
+        [loadDiagram],
+    )
+
+    // Auto-save diagram XML to the active file when draw.io fires auto-save
+    const handleDiagramChange = useCallback(
+        (data: { xml?: string }) => {
+            // Forward to the context's auto-save handler
+            handleDiagramAutoSave(data)
+
+            // If we have a current file and new XML content, debounce-save it
+            if (data.xml && currentFileRef.current) {
+                if (autoSaveTimerRef.current) {
+                    clearTimeout(autoSaveTimerRef.current)
+                }
+                autoSaveTimerRef.current = setTimeout(async () => {
+                    const { updateFile } = await import("@/lib/diagram-files")
+                    const updated = await updateFile(
+                        currentFileRef.current!.id,
+                        { xml: data.xml },
+                    )
+                    if (updated) {
+                        currentFileRef.current = updated
+                    }
+                }, 1500)
+            }
+        },
+        [handleDiagramAutoSave],
+    )
+
     return (
-        <div className="h-screen bg-background relative overflow-hidden">
+        <div className="h-screen bg-background relative overflow-hidden flex flex-col">
+            <FileManagerBar
+                currentFileId={currentFileId}
+                onFileSelect={handleFileSelect}
+            />
             <ResizablePanelGroup
                 id="main-panel-group"
                 direction={isMobile ? "vertical" : "horizontal"}
-                className="h-full"
+                className="flex-1"
             >
                 <ResizablePanel
                     id="drawio-panel"
@@ -180,7 +236,7 @@ export default function Home() {
                                         key={`${drawioUi}-${darkMode}-${currentLang}-${isElectron}`}
                                         ref={drawioRef}
                                         autosave
-                                        onAutoSave={handleDiagramAutoSave}
+                                        onAutoSave={handleDiagramChange}
                                         onExport={handleDiagramExport}
                                         onLoad={handleDrawioLoad}
                                         baseUrl={drawioBaseUrl}
