@@ -1,7 +1,6 @@
 "use client"
 
 import {
-    Cloud,
     CloudDownload,
     CloudUpload,
     ExternalLink,
@@ -33,12 +32,18 @@ import {
     deleteFile,
     jsonToXml,
     listFiles,
-    parseSyncPayload,
+    saveFile,
     updateFile,
     xmlToJson,
 } from "@/lib/diagram-files"
 import { createOrUpdateFile, getFile as getGitHubFile } from "@/lib/github-api"
-import { GitHubSyncDialog } from "./GitHubSyncDialog"
+import {
+    type GlobalGitHubConfig,
+    getGlobalGitHubConfig,
+    getGlobalGitHubSyncState,
+    saveGlobalGitHubSyncState,
+} from "@/lib/global-github-config"
+import { GlobalGitHubConfigDialog } from "./GlobalGitHubConfigDialog"
 
 type EditTab = "name" | "xml" | "json"
 
@@ -69,13 +74,17 @@ function FileListContent({
     const [editXml, setEditXml] = useState("")
     const [editJson, setEditJson] = useState("")
 
-    const [syncingFileId, setSyncingFileId] = useState<string | null>(null)
-    const [pullingFileId, setPullingFileId] = useState<string | null>(null)
-    const [syncDialogFile, setSyncDialogFile] = useState<DiagramFile | null>(
-        null,
-    )
     const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
     const newNameInputRef = useRef<HTMLInputElement>(null)
+
+    // Global GitHub state
+    const [globalConfig, setGlobalConfig] = useState<GlobalGitHubConfig | null>(
+        null,
+    )
+    const [showGlobalConfig, setShowGlobalConfig] = useState(false)
+    const [pullingAll, setPullingAll] = useState(false)
+    const [pushingAll, setPushingAll] = useState(false)
+    const autoPulledRef = useRef(false)
 
     const loadFiles = useCallback(async () => {
         setLoading(true)
@@ -94,25 +103,25 @@ function FileListContent({
             setShowNewInput(false)
             setEditingFile(null)
             setConfirmDelete(null)
+            setGlobalConfig(getGlobalGitHubConfig())
+            autoPulledRef.current = false
         }
     }, [open, loadFiles])
 
-    // ── helpers ───────────────────────────────────────────────
-
-    /** Build the payload pushed to GitHub — includes both xml and json */
-    function buildSyncPayload(file: DiagramFile) {
-        return JSON.stringify(
-            {
-                name: file.name,
-                updatedAt: file.updatedAt,
-                xml: file.xml,
-                json: file.json || xmlToJson(file.xml),
-                thumbnailSvg: file.thumbnailSvg,
-            },
-            null,
-            2,
-        )
-    }
+    // Auto-pull all files from GitHub when dialog opens and global config is set
+    useEffect(() => {
+        if (
+            open &&
+            !loading &&
+            globalConfig &&
+            files.length > 0 &&
+            !autoPulledRef.current
+        ) {
+            autoPulledRef.current = true
+            handlePullAll()
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [open, loading, globalConfig, files.length])
 
     // ── CRUD ──────────────────────────────────────────────────
 
@@ -136,7 +145,6 @@ function FileListContent({
     }
 
     const handleLoadFile = (file: DiagramFile) => {
-        // The page will load file.xml into draw.io via loadDiagram()
         onFileSelect(file)
         onOpenChange(false)
     }
@@ -174,7 +182,6 @@ function FileListContent({
             updates.name = editName.trim()
         }
 
-        // Save both xml and json, keeping them in sync
         updates.xml = editXml
         updates.json = editJson
 
@@ -183,7 +190,6 @@ function FileListContent({
             toast.success("文件已保存")
             setEditingFile(null)
             await loadFiles()
-            // If the file is currently selected, update the canvas
             if (editingFile.id === selectedFileId) {
                 onFileSelect(result)
             }
@@ -192,90 +198,160 @@ function FileListContent({
         }
     }
 
-    // ── GitHub sync ───────────────────────────────────────────
+    // ── Global GitHub sync (single file: data/nextall.json) ──
 
-    const handlePush = async (file: DiagramFile) => {
-        if (!file.githubToken || !file.githubOwner || !file.githubRepo) {
-            toast.warning("请先配置 GitHub 同步")
-            setSyncDialogFile(file)
-            return
-        }
-        setSyncingFileId(file.id)
-        try {
-            const payload = buildSyncPayload(file)
-            const result = await createOrUpdateFile(
-                file.githubToken,
-                file.githubOwner,
-                file.githubRepo,
-                file.githubPath,
-                payload,
-                `Update ${file.name} - ${new Date().toISOString()}`,
-                file.lastSyncSha || undefined,
-            )
-            await updateFile(file.id, {
-                lastSyncedAt: Date.now(),
-                lastSyncSha: result.sha,
-            })
-            await loadFiles()
-            toast.success("已同步到 GitHub")
-        } catch (e) {
-            toast.error(
-                e instanceof Error ? e.message : "同步失败，请检查配置和网络",
-            )
-        } finally {
-            setSyncingFileId(null)
-        }
-    }
-
-    const handlePull = async (file: DiagramFile) => {
-        if (!file.githubToken || !file.githubOwner || !file.githubRepo) {
-            toast.warning("请先配置 GitHub 同步")
-            setSyncDialogFile(file)
-            return
-        }
-        setPullingFileId(file.id)
+    const handlePullAll = async () => {
+        if (!globalConfig) return
+        setPullingAll(true)
         try {
             const result = await getGitHubFile(
-                file.githubToken,
-                file.githubOwner,
-                file.githubRepo,
-                file.githubPath,
+                globalConfig.token,
+                globalConfig.owner,
+                globalConfig.repo,
+                globalConfig.path,
             )
             if (!result) {
-                toast.error("远程文件不存在")
+                toast.info("远程文件尚不存在，请先推送")
+                setPullingAll(false)
                 return
             }
+
             const decoded = atob(result.data.content || "")
-            let payload: Record<string, unknown>
+            let payload: {
+                files?: Array<{
+                    id: string
+                    name: string
+                    xml: string
+                    json?: string
+                    thumbnailSvg?: string
+                    updatedAt: number
+                }>
+            }
             try {
                 payload = JSON.parse(decoded)
             } catch {
-                toast.error("远程文件不是有效的 JSON 格式")
+                toast.error("远程文件格式错误")
+                setPullingAll(false)
                 return
             }
 
-            const updates = parseSyncPayload(payload, file)
-            if (Object.keys(updates).length === 0) {
-                toast.error("远程文件格式无法解析")
+            if (!payload.files || !Array.isArray(payload.files)) {
+                toast.error("远程文件格式无效")
+                setPullingAll(false)
                 return
             }
-            updates.lastSyncedAt = Date.now()
-            updates.lastSyncSha = result.sha
 
-            await updateFile(file.id, updates)
-            toast.success("已从 GitHub 拉取最新版本")
+            // Refresh local files list for comparison
+            const localFiles = await listFiles()
+            const localMap = new Map(localFiles.map((f) => [f.id, f]))
+
+            let updated = 0
+            let created = 0
+            for (const remoteFile of payload.files) {
+                const existing = localMap.get(remoteFile.id)
+                if (existing) {
+                    await updateFile(remoteFile.id, {
+                        name: remoteFile.name,
+                        xml: remoteFile.xml,
+                        json: remoteFile.json || xmlToJson(remoteFile.xml),
+                        thumbnailSvg: remoteFile.thumbnailSvg,
+                        lastSyncedAt: Date.now(),
+                    })
+                    updated++
+                } else {
+                    await saveFile({
+                        id: remoteFile.id,
+                        name: remoteFile.name,
+                        xml: remoteFile.xml,
+                        json: remoteFile.json || xmlToJson(remoteFile.xml),
+                        thumbnailSvg: remoteFile.thumbnailSvg,
+                        createdAt: remoteFile.updatedAt,
+                        githubOwner: "",
+                        githubRepo: "",
+                        githubPath: "",
+                        githubToken: "",
+                    })
+                    created++
+                }
+            }
+
+            // Save the SHA for future updates
+            saveGlobalGitHubSyncState({
+                sha: result.sha,
+                lastSyncedAt: Date.now(),
+            })
+
             await loadFiles()
-
-            // If the pulled file is the active one, reload it into the canvas
-            if (updates.xml && file.id === selectedFileId) {
-                onFileSelect({ ...file, ...updates })
+            if (updated > 0 || created > 0) {
+                toast.success(`已拉取：${updated} 个更新，${created} 个新建`)
+            } else {
+                toast.info("远程无更新")
             }
         } catch (e) {
             toast.error(
                 e instanceof Error ? e.message : "拉取失败，请检查配置和网络",
             )
         } finally {
-            setPullingFileId(null)
+            setPullingAll(false)
+        }
+    }
+
+    const handlePushAll = async () => {
+        if (!globalConfig) {
+            toast.warning("请先配置 GitHub 同步")
+            setShowGlobalConfig(true)
+            return
+        }
+        if (files.length === 0) {
+            toast.info("没有文件需要推送")
+            return
+        }
+        setPushingAll(true)
+        try {
+            // Build a single JSON containing all files
+            const filesData = files.map((f) => ({
+                id: f.id,
+                name: f.name,
+                xml: f.xml,
+                json: f.json || xmlToJson(f.xml),
+                thumbnailSvg: f.thumbnailSvg,
+                updatedAt: f.updatedAt,
+            }))
+            const payload = JSON.stringify({ files: filesData }, null, 2)
+
+            const syncState = getGlobalGitHubSyncState()
+
+            const result = await createOrUpdateFile(
+                globalConfig.token,
+                globalConfig.owner,
+                globalConfig.repo,
+                globalConfig.path,
+                payload,
+                `Sync diagrams - ${new Date().toISOString()}`,
+                syncState?.sha || undefined,
+            )
+
+            // Save the SHA for future updates
+            saveGlobalGitHubSyncState({
+                sha: result.sha,
+                lastSyncedAt: Date.now(),
+            })
+
+            // Update lastSyncedAt for all local files
+            for (const file of files) {
+                await updateFile(file.id, {
+                    lastSyncedAt: Date.now(),
+                })
+            }
+
+            await loadFiles()
+            toast.success(`已成功同步 ${files.length} 个文件到 GitHub`)
+        } catch (e) {
+            toast.error(
+                e instanceof Error ? e.message : "推送失败，请检查配置和网络",
+            )
+        } finally {
+            setPushingAll(false)
         }
     }
 
@@ -296,11 +372,75 @@ function FileListContent({
         }
     }
 
-    const hasGitHubConfig = (file: DiagramFile) =>
-        !!file.githubOwner && !!file.githubRepo && !!file.githubToken
-
     return (
         <div className="flex flex-col h-full max-h-[75vh]">
+            {/* ── Global GitHub toolbar ───────────────────────── */}
+            <div className="px-6 pt-3 pb-2 border-b border-border-subtle flex items-center gap-2">
+                {globalConfig ? (
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={handlePullAll}
+                        disabled={pullingAll}
+                    >
+                        <CloudDownload
+                            className={`h-3.5 w-3.5 mr-1.5 ${
+                                pullingAll ? "animate-pulse" : ""
+                            }`}
+                        />
+                        {pullingAll ? "拉取中..." : "拉取所有"}
+                    </Button>
+                ) : (
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs text-muted-foreground"
+                        onClick={() => setShowGlobalConfig(true)}
+                    >
+                        <Github className="h-3.5 w-3.5 mr-1.5" />
+                        配置 GitHub
+                    </Button>
+                )}
+                {globalConfig && (
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={handlePushAll}
+                        disabled={pushingAll}
+                    >
+                        <CloudUpload
+                            className={`h-3.5 w-3.5 mr-1.5 ${
+                                pushingAll ? "animate-pulse" : ""
+                            }`}
+                        />
+                        {pushingAll ? "推送中..." : "推送所有"}
+                    </Button>
+                )}
+                {globalConfig && (
+                    <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={() => setShowGlobalConfig(true)}
+                        title="GitHub 配置"
+                    >
+                        <Github className="h-3.5 w-3.5 mr-1.5" />
+                        {globalConfig.owner}/{globalConfig.repo}
+                        <span className="text-muted-foreground/50 ml-1">
+                            {globalConfig.path}
+                        </span>
+                    </Button>
+                )}
+                <div className="flex-1" />
+                {pullingAll && (
+                    <span className="text-[11px] text-muted-foreground animate-pulse">
+                        正在从 GitHub 同步...
+                    </span>
+                )}
+            </div>
+
             {/* ── New file input ─────────────────────────────── */}
             {showNewInput && (
                 <div className="px-6 pt-4 pb-3 border-b border-border-subtle">
@@ -382,7 +522,7 @@ function FileListContent({
                                     <span className="text-sm font-medium truncate">
                                         {file.name}
                                     </span>
-                                    {hasGitHubConfig(file) && (
+                                    {file.lastSyncedAt && (
                                         <Github className="h-3 w-3 text-muted-foreground/40 shrink-0" />
                                     )}
                                 </div>
@@ -400,7 +540,7 @@ function FileListContent({
                                     {file.lastSyncedAt && (
                                         <>
                                             <span>·</span>
-                                            <Cloud className="h-3 w-3" />
+                                            <CloudUpload className="h-3 w-3" />
                                             <span>
                                                 {new Date(
                                                     file.lastSyncedAt,
@@ -416,7 +556,7 @@ function FileListContent({
                                 </div>
                             </div>
 
-                            {/* Actions */}
+                            {/* Actions - only load, edit, delete */}
                             <div className="flex items-center gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity shrink-0">
                                 <Button
                                     variant="ghost"
@@ -435,47 +575,6 @@ function FileListContent({
                                     onClick={() => startEdit(file)}
                                 >
                                     <Pencil className="h-3.5 w-3.5" />
-                                </Button>
-                                <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-7 w-7"
-                                    title="GitHub 配置"
-                                    onClick={() => setSyncDialogFile(file)}
-                                >
-                                    <Github className="h-3.5 w-3.5" />
-                                </Button>
-                                <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-7 w-7"
-                                    title="从 GitHub 拉取最新"
-                                    onClick={() => handlePull(file)}
-                                    disabled={pullingFileId === file.id}
-                                >
-                                    <CloudDownload
-                                        className={`h-3.5 w-3.5 ${
-                                            pullingFileId === file.id
-                                                ? "animate-pulse"
-                                                : ""
-                                        }`}
-                                    />
-                                </Button>
-                                <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-7 w-7"
-                                    title="同步到 GitHub"
-                                    onClick={() => handlePush(file)}
-                                    disabled={syncingFileId === file.id}
-                                >
-                                    <CloudUpload
-                                        className={`h-3.5 w-3.5 ${
-                                            syncingFileId === file.id
-                                                ? "animate-pulse"
-                                                : ""
-                                        }`}
-                                    />
                                 </Button>
                                 <Button
                                     variant="ghost"
@@ -628,17 +727,18 @@ function FileListContent({
                 </div>
             )}
 
-            {/* ── GitHub sync config dialog ──────────────────── */}
-            <GitHubSyncDialog
-                open={!!syncDialogFile}
+            {/* ── Global GitHub config dialog ────────────────── */}
+            <GlobalGitHubConfigDialog
+                open={showGlobalConfig}
                 onOpenChange={(open) => {
+                    setShowGlobalConfig(open)
                     if (!open) {
-                        setSyncDialogFile(null)
+                        setGlobalConfig(getGlobalGitHubConfig())
                         loadFiles()
                     }
                 }}
-                file={syncDialogFile}
                 onConfigSaved={() => {
+                    setGlobalConfig(getGlobalGitHubConfig())
                     loadFiles()
                 }}
             />

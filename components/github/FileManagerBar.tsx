@@ -1,9 +1,10 @@
 "use client"
 
 import { FileJson, Github, Plus } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { type DiagramFile, listFiles } from "@/lib/diagram-files"
+import { getGlobalGitHubConfig } from "@/lib/global-github-config"
 import { FileListDialog } from "./FileListDialog"
 
 interface FileManagerBarProps {
@@ -27,7 +28,8 @@ export function FileManagerBar({
 
     const handleOpen = () => setOpen(true)
 
-    const hasSync = currentFile?.githubOwner && currentFile?.githubToken
+    const globalConfig = getGlobalGitHubConfig()
+    const hasSync = !!globalConfig
 
     return (
         <>
