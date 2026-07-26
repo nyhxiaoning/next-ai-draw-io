@@ -36,7 +36,11 @@ import {
     updateFile,
     xmlToJson,
 } from "@/lib/diagram-files"
-import { createOrUpdateFile, getFile as getGitHubFile } from "@/lib/github-api"
+import {
+    base64Decode,
+    createOrUpdateFile,
+    getFile as getGitHubFile,
+} from "@/lib/github-api"
 import {
     type GlobalGitHubConfig,
     getGlobalGitHubConfig,
@@ -77,6 +81,13 @@ function FileListContent({
     const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
     const newNameInputRef = useRef<HTMLInputElement>(null)
 
+    // Inline rename state
+    const [renamingFileId, setRenamingFileId] = useState<string | null>(null)
+    const [renameValue, setRenameValue] = useState("")
+    const renameInputRef = useRef<HTMLInputElement>(null)
+    const xmlTextareaRef = useRef<HTMLTextAreaElement>(null)
+    const jsonTextareaRef = useRef<HTMLTextAreaElement>(null)
+
     // Global GitHub state
     const [globalConfig, setGlobalConfig] = useState<GlobalGitHubConfig | null>(
         null,
@@ -84,7 +95,6 @@ function FileListContent({
     const [showGlobalConfig, setShowGlobalConfig] = useState(false)
     const [pullingAll, setPullingAll] = useState(false)
     const [pushingAll, setPushingAll] = useState(false)
-    const autoPulledRef = useRef(false)
 
     const loadFiles = useCallback(async () => {
         setLoading(true)
@@ -103,25 +113,10 @@ function FileListContent({
             setShowNewInput(false)
             setEditingFile(null)
             setConfirmDelete(null)
+            setRenamingFileId(null)
             setGlobalConfig(getGlobalGitHubConfig())
-            autoPulledRef.current = false
         }
     }, [open, loadFiles])
-
-    // Auto-pull all files from GitHub when dialog opens and global config is set
-    useEffect(() => {
-        if (
-            open &&
-            !loading &&
-            globalConfig &&
-            files.length > 0 &&
-            !autoPulledRef.current
-        ) {
-            autoPulledRef.current = true
-            handlePullAll()
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [open, loading, globalConfig, files.length])
 
     // ── CRUD ──────────────────────────────────────────────────
 
@@ -174,6 +169,56 @@ function FileListContent({
         toast.success("已从 XML 生成 JSON")
     }
 
+    // ── Inline rename ─────────────────────────────────────────
+
+    const handleStartRename = (file: DiagramFile) => {
+        setRenamingFileId(file.id)
+        setRenameValue(file.name)
+        // Focus the input after render
+        requestAnimationFrame(() => renameInputRef.current?.focus())
+    }
+
+    const handleSaveRename = async () => {
+        if (!renamingFileId) return
+        const trimmed = renameValue.trim()
+        if (!trimmed) {
+            toast.warning("文件名称不能为空")
+            return
+        }
+        const result = await updateFile(renamingFileId, { name: trimmed })
+        if (result) {
+            toast.success("名称已更新")
+            if (renamingFileId === selectedFileId) {
+                onFileSelect(result)
+            }
+            await loadFiles()
+        } else {
+            toast.error("重命名失败")
+        }
+        setRenamingFileId(null)
+    }
+
+    const handleCancelRename = () => {
+        setRenamingFileId(null)
+    }
+
+    // ── Auto-resize textarea ─────────────────────────────────
+
+    const autoResizeTextarea = (el: HTMLTextAreaElement) => {
+        el.style.height = "auto"
+        el.style.height = `${el.scrollHeight}px`
+    }
+
+    // Auto-resize on tab switch and dialog open
+    useEffect(() => {
+        if (editTab === "xml" && xmlTextareaRef.current) {
+            autoResizeTextarea(xmlTextareaRef.current)
+        }
+        if (editTab === "json" && jsonTextareaRef.current) {
+            autoResizeTextarea(jsonTextareaRef.current)
+        }
+    }, [editTab, editingFile])
+
     const handleSaveEdit = async () => {
         if (!editingFile) return
         const updates: Partial<DiagramFile> = {}
@@ -216,7 +261,7 @@ function FileListContent({
                 return
             }
 
-            const decoded = atob(result.data.content || "")
+            const decoded = base64Decode(result.data.content || "")
             let payload: {
                 files?: Array<{
                     id: string
@@ -373,7 +418,7 @@ function FileListContent({
     }
 
     return (
-        <div className="flex flex-col h-full max-h-[75vh]">
+        <div className="flex flex-col h-full max-h-[85vh]">
             {/* ── Global GitHub toolbar ───────────────────────── */}
             <div className="px-6 pt-3 pb-2 border-b border-border-subtle flex items-center gap-2">
                 {globalConfig ? (
@@ -519,9 +564,34 @@ function FileListContent({
                             {/* Info */}
                             <div className="min-w-0 flex-1">
                                 <div className="flex items-center gap-2">
-                                    <span className="text-sm font-medium truncate">
-                                        {file.name}
-                                    </span>
+                                    {renamingFileId === file.id ? (
+                                        <Input
+                                            ref={renameInputRef}
+                                            value={renameValue}
+                                            onChange={(e) =>
+                                                setRenameValue(e.target.value)
+                                            }
+                                            className="h-8 text-sm"
+                                            onKeyDown={(e) => {
+                                                if (e.key === "Enter") {
+                                                    e.preventDefault()
+                                                    handleSaveRename()
+                                                }
+                                                if (e.key === "Escape")
+                                                    handleCancelRename()
+                                            }}
+                                        />
+                                    ) : (
+                                        <span
+                                            className="text-sm font-medium truncate cursor-pointer rounded px-1.5 py-0.5 -mx-1.5 hover:bg-muted/60 transition-colors"
+                                            title="点击重命名"
+                                            onClick={() =>
+                                                handleStartRename(file)
+                                            }
+                                        >
+                                            {file.name}
+                                        </span>
+                                    )}
                                     {file.lastSyncedAt && (
                                         <Github className="h-3 w-3 text-muted-foreground/40 shrink-0" />
                                     )}
@@ -620,16 +690,31 @@ function FileListContent({
 
             {/* ── Edit dialog (inline overlay) ───────────────── */}
             {editingFile && (
-                <div className="fixed inset-0 z-[60] bg-black/20 backdrop-blur-[1px] flex items-center justify-center p-4">
-                    <div className="bg-surface-0 rounded-2xl border border-border-subtle shadow-dialog w-full max-w-2xl overflow-hidden animate-in fade-in zoom-in-[0.98] duration-200 flex flex-col max-h-[90vh]">
-                        {/* Header */}
-                        <div className="px-6 pt-5 pb-4 border-b border-border-subtle shrink-0">
-                            <h3 className="text-base font-semibold">
-                                编辑文件
-                            </h3>
-                            <p className="text-xs text-muted-foreground mt-1">
-                                支持 XML 和 JSON 两种格式，修改后自动保持同步
-                            </p>
+                <div className="fixed inset-0 z-[60] bg-black/20 backdrop-blur-[1px] flex justify-center">
+                    <div className="bg-surface-0 rounded-2xl border border-border-subtle shadow-dialog w-full max-w-2xl overflow-y-auto animate-in fade-in zoom-in-[0.98] duration-200 flex flex-col h-screen my-0">
+                        {/* Header with save button */}
+                        <div className="px-6 pt-5 pb-4 border-b border-border-subtle shrink-0 flex items-start gap-4">
+                            <div className="min-w-0 flex-1">
+                                <h3 className="text-base font-semibold">
+                                    编辑文件
+                                </h3>
+                                <p className="text-xs text-muted-foreground mt-1">
+                                    支持 XML 和 JSON
+                                    两种格式，修改后自动保持同步
+                                </p>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0 pt-0.5">
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => setEditingFile(null)}
+                                >
+                                    取消
+                                </Button>
+                                <Button size="sm" onClick={handleSaveEdit}>
+                                    保存
+                                </Button>
+                            </div>
                         </div>
 
                         {/* Name */}
@@ -690,38 +775,30 @@ function FileListContent({
                         </div>
 
                         {/* Editor */}
-                        <div className="px-6 py-3 flex-1 overflow-y-auto min-h-0">
+                        <div className="px-6 py-3 flex-1">
                             {editTab === "xml" ? (
                                 <Textarea
+                                    ref={xmlTextareaRef}
                                     value={editXml}
-                                    onChange={(e) => setEditXml(e.target.value)}
-                                    className="min-h-70 font-mono text-xs leading-relaxed"
+                                    onChange={(e) => {
+                                        setEditXml(e.target.value)
+                                        autoResizeTextarea(e.target)
+                                    }}
+                                    className="font-mono text-xs leading-relaxed min-h-[200px]"
                                     placeholder="draw.io XML 内容..."
                                 />
                             ) : (
                                 <Textarea
+                                    ref={jsonTextareaRef}
                                     value={editJson}
-                                    onChange={(e) =>
+                                    onChange={(e) => {
                                         setEditJson(e.target.value)
-                                    }
-                                    className="min-h-70 font-mono text-xs leading-relaxed"
+                                        autoResizeTextarea(e.target)
+                                    }}
+                                    className="font-mono text-xs leading-relaxed min-h-[200px]"
                                     placeholder='{ "xml": "<mxfile>...</mxfile>" }'
                                 />
                             )}
-                        </div>
-
-                        {/* Footer */}
-                        <div className="px-6 py-4 border-t border-border-subtle flex justify-end gap-2 shrink-0">
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setEditingFile(null)}
-                            >
-                                取消
-                            </Button>
-                            <Button size="sm" onClick={handleSaveEdit}>
-                                保存
-                            </Button>
                         </div>
                     </div>
                 </div>

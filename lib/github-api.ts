@@ -17,6 +17,18 @@ export interface GitHubTreeItem {
 
 const GITHUB_API = "https://api.github.com"
 
+/** Unicode-safe base64 encode (handles Chinese characters, emoji, etc.) */
+function base64Encode(str: string): string {
+    return btoa(String.fromCharCode(...new TextEncoder().encode(str)))
+}
+
+/** Unicode-safe base64 decode */
+export function base64Decode(base64: string): string {
+    return new TextDecoder().decode(
+        Uint8Array.from(atob(base64), (c) => c.charCodeAt(0)),
+    )
+}
+
 class GitHubApiError extends Error {
     status: number
     constructor(message: string, status: number) {
@@ -86,7 +98,7 @@ export async function createOrUpdateFile(
 ): Promise<{ content: GitHubContent; sha: string }> {
     const body: Record<string, string> = {
         message,
-        content: btoa(content),
+        content: base64Encode(content),
     }
     if (sha) body.sha = sha
 
